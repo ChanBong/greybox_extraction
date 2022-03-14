@@ -1,5 +1,5 @@
 # Imports for transform and dataset prepration
-
+import numpy as np
 from torch.optim.lr_scheduler import StepLR, ExponentialLR
 from torch.utils.data import TensorDataset, DataLoader, Dataset, WeightedRandomSampler
 import torchvision.datasets as datasets
@@ -24,6 +24,16 @@ from pytorchvideo.transforms import (
     ShortSideScale,
     UniformTemporalSubsample
 )
+
+def topk(output, target, maxk=5):
+    """Computes the precision@k for the specified value of maxk"""
+    batch_size = target.size(0)
+    _, pred = output.topk(maxk, 1, True, True)
+    pred = pred.t()
+    correct = pred.eq(target.view(1, -1).expand_as(pred))
+    correct_k = correct[:maxk].view(-1).float().sum(0)
+    return correct_k.mul_(100.0 / batch_size)
+
 
 # Train transform and other utils
 
@@ -108,7 +118,8 @@ data_jitter_hue = transforms.Compose([
 ])
 
 def tofloat(x):
-  return x[:32].float()
+  # return x[:32].float()
+    return x.float()
 class shift():
   def __init__(self, sz):
     self.sz = sz
@@ -126,8 +137,8 @@ train_transform = transforms.Compose([
                     transforms.Resize(224),
                     transforms.Normalize((123, 116, 103), (58, 57, 57)),
                     transforms.RandomHorizontalFlip(p=0.5),
-                    transforms.ColorJitter(brightness=2),
-                    transforms.RandomRotation(15)
+                    # transforms.ColorJitter(brightness=2),
+                    # transforms.RandomRotation(15)
                   ])
 
 
@@ -135,11 +146,14 @@ train_transform = transforms.Compose([
 
 batch_size = 16
 def collate_fn(batch):
+    # print(batch[:10])
     x = torch.stack([torch.tensor(data_item[0]) for data_item in batch])
     y = [int(data_item[2]) for data_item in batch]
-    return x[:32], y
+    # return x[:32], y
+    return x, y
+    
 
-train_kinetics = datasets.Kinetics("../k400val_pytorch", frames_per_clip= 16, split='val', num_classes= '400', step_between_clips= 2000000, transform = train_transform,  download= False, num_download_workers= 1, num_workers= 80)
+train_kinetics = datasets.Kinetics("../k400val_pytorch_dummy", frames_per_clip= 16, split='val', num_classes= '400', step_between_clips= 2000000, transform = train_transform,  download= False, num_download_workers= 1, num_workers= 80)
 #train_ucf = datasets.UCF101("./data/", annotation_path = "ucf_annotation.csv", frames_per_clip= 32, step_between_clips = 2, transform = train_transform, num_workers= 10)
 #train_hmdb51 = datasets.HMDB51("./data/", annotation_path = "hmdb51_annotation.csv", frames_per_clip= 32, step_between_clips = 2, transform = train_transform, num_workers= 10)
 #train_ds = torch.utils.data.ConcatDataset([train_kinetics, train_ucf, train_hmdb51])
@@ -147,22 +161,6 @@ train_ds = train_kinetics
 test_ds = train_kinetics
 train_dl = DataLoader(train_ds, collate_fn=collate_fn, batch_size = batch_size, shuffle = True);
 test_dl = DataLoader(test_ds, collate_fn=collate_fn, batch_size = batch_size, shuffle = True);
-
-
-# Load pretrained c3net
-
-net = C3D()
-#net.fc8 = nn.Linear(in_features=4096, out_features=400, bias=True)
-net.load_state_dict(torch.load('c3d.pickle'))
-net.fc8 = nn.Linear(in_features=4096, out_features=400, bias=True)
-size_changer = torch.nn.AvgPool3d((1, 2, 2), stride=None, padding=0, ceil_mode=False)
-#ct = 0
-#for child in net.children():
-#  ct += 1
-#  if ct >= 14:
-#      child.requires_grad = False
-
-print(net)
 
 
 # Main code for network extraction 
@@ -197,27 +195,48 @@ def get_accuracy(pred, actual):
 
 def train_with_extraction(model, victim):
     # again, batch_size=1 due to compute restrictions on colab
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    ct = 0
+    ls1 = []
+    ls2 = []
+    for child in model.children():
+        ct += 1
+        if ct >= 14:
+           ls2+=list(child.parameters())
+        else:
+           ls1+=list(child.parameters())
+    optim1 = torch.optim.Adam(ls1, lr=0.001)
+    optim2 = torch.optim.Adam(ls2, lr=0.01)
     criterion = nn.MSELoss()
+
+    #optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    #criterion = nn.MSELoss()
 
     for idx in range(10):
       print('\nStarting Epoch: {}\n'.format(idx))
       rloss = 0.0;
       model.train()
       for step,(video, label) in enumerate(train_dl):
-          # if step>1:
-          #    break
+          if step>1:
+              break
           torch.cuda.empty_cache()
-          optimizer.zero_grad()
+
+          optim1.zero_grad()
+          optim2.zero_grad()
+          
           video = Variable(video.to(DEVICE), requires_grad=False)
           video = video.permute(0, 2, 1, 3, 4)
-          video = size_changer(video[:,:,:16])
-          pred = model(video)
           label_ = victim(video)
+         
+          video = size_changer(video)
+          pred = model(video)
+
+          # print(pred.size(), label_.size())
+          
           loss = criterion(pred,label_)
           rloss+=loss.item()
           loss.backward()
-          optimizer.step()
+          optim1.step()
+          optim2.step()
           # print(f'Predicted class: {torch.argmax(pred, dim=1)}, Teacher class: {label_}, Actual label: {label}')
           print(rloss/(step+1))
 
@@ -225,16 +244,20 @@ def train_with_extraction(model, victim):
       print('evaluation:')
       model.eval()
       with torch.no_grad():
-        for step,(video, label) in enumerate(test_dl):
-          video = Variable(video.to(DEVICE), requires_grad=False)
-          video = video.permute(0, 2, 1, 3, 4)
-          video = size_changer(video[:,:,:16])
-          prediction = model(video)
-          l_ = victim(video)
-          # print(f'Predicted class: {torch.argmax(p, dim=1).item()}, Teacher class: {l_.item()}, Actual label: {l}')
-          print(torch.argmax(prediction, dim=1), label)
+          acc = []
+          for step,(video, label) in enumerate(test_dl):
+              video = Variable(video.to(DEVICE), requires_grad=False)
+              video = video.permute(0, 2, 1, 3, 4)
+              l_ = victim(video)
+              video = size_changer(video)
+              prediction = model(video)
+          # l_ = victim(video)
+              print(f'Predicted class: {torch.argmax(prediction, dim=1)}, Teacher class: {torch.argmax(l_, dim=1)}, Actual label: {label}')
+          # print(torch.argmax(prediction, dim=1), label)
           # print(f'Accuracy : {(torch.sum(torch.argmax(prediction, dim=1) == label)/len(label))*100.0}%')
-          print(f'Accuracy : {get_accuracy(torch.argmax(prediction, dim=1).tolist(), label)}')
+              print(f'Accuracy : {get_accuracy(torch.argmax(prediction, dim=1).tolist(), label)}')
+              acc.append(topk(prediction, torch.argmax(l_, dim=1), 1))
+      print(np.mean(acc))
 
 # wrapper around mmactions Recognizer3d class to provide nn.Module like interface
 # (for compatibility with ignite methods)
@@ -255,7 +278,12 @@ if __name__ == '__main__':
     victim = MMActionModelWrapper(model_victim)
     for param in victim.parameters():
       param.requires_grad = False
+    victim.eval()
 
+    net = C3D()
+    net.load_state_dict(torch.load('c3d.pickle'))
+    net.fc8 = nn.Linear(in_features=4096, out_features=400, bias=True)
+    size_changer = torch.nn.AvgPool3d((1, 2, 2), stride=None, padding=0, ceil_mode=False)
     # adversary = torch.hub.load('facebookresearch/pytorchvideo', 'slow_r50', pretrained=False)
 
     # model_adversary = build_model(cfg.model, train_cfg=None, test_cfg=None)
