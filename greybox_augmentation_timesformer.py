@@ -11,10 +11,13 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 import torch
 from torch.autograd import Variable
+from timesformer.models.vit import TimeSformer
 
-from movinets import MoViNet
-from movinets.config import _C
-from c3d_pytorch.C3D_model import C3D
+timesformer = TimeSformer(img_size=224, num_classes=400, num_frames=8, attention_type='divided_space_time',  pretrained_model='/path/to/pretrained/model.pyth')
+
+# from movinets import MoViNet
+# from movinets.config import _C
+# from c3d_pytorch.C3D_model import C3D
 
 from pytorchvideo.transforms import (
     ApplyTransformToKey,
@@ -129,7 +132,7 @@ def pr(x):
   print(x.shape)
   return x
 
-train_transform_Swin = transforms.Compose([
+train_transform = transforms.Compose([
                     #transforms.Lambda(lambda x: x / 255.0),
                     #transforms.functional.uniform_temporal_subsample_repeated(32, (1,0), temporal_dim = 2),
                     tofloat,
@@ -140,29 +143,8 @@ train_transform_Swin = transforms.Compose([
                     # transforms.ColorJitter(brightness=2),
                     # transforms.RandomRotation(15)
                   ])
-train_transform_ResNet = transforms.Compose([
-                    transforms.Lambda(lambda x: x / 255.0),
-                    #transforms.functional.uniform_temporal_subsample_repeated(32, (1,0), temporal_dim = 2),
-                    tofloat,
-                    transforms.CenterCrop(224),
-                    transforms.Resize(112),
-                    transforms.Normalize((0.43, 0.39, 0.37), (0.22, 0.22, 0.21)),
-                    transforms.RandomHorizontalFlip(p=0.5),
-                    # transforms.ColorJitter(brightness=2),
-                    # transforms.RandomRotation(15)
-                  ])
 
-train_transform = transforms.Compose([
-                    #transforms.Lambda(lambda x: x / 255.0),
-                    #transforms.functional.uniform_temporal_subsample_repeated(32, (1,0), temporal_dim = 2),
-                    tofloat,
-                    transforms.CenterCrop(224),
-                    transforms.Resize(224),
-                    #transforms.Normalize((123, 116, 103), (58, 57, 57)),
-                    #transforms.RandomHorizontalFlip(p=0.5),
-                    # transforms.ColorJitter(brightness=2),
-                    # transforms.RandomRotation(15)
-                  ])
+
 # Load Dataset
 
 batch_size = 32
@@ -174,9 +156,7 @@ def collate_fn(batch):
     return x, y
     
 
-#train_kinetics = datasets.Kinetics("../k400val_pytorch_dummy", frames_per_clip= 16, split='val', num_classes= '400', step_between_clips= 2000000, transform = train_transform,  download= False, num_download_workers= 1, num_workers= 80)
-train_kinetics = datasets.Kinetics("../k400samples", frames_per_clip= 16, split='val', num_classes= '400', step_between_clips= 2000000, transform = train_transform,  download= False, num_download_workers= 1, num_workers= 80)
-
+train_kinetics = datasets.Kinetics("../k400val_pytorch_dummy", frames_per_clip= 16, split='val', num_classes= '400', step_between_clips= 2000000, transform = train_transform,  download= False, num_download_workers= 1, num_workers= 80)
 #train_ucf = datasets.UCF101("./data/", annotation_path = "ucf_annotation.csv", frames_per_clip= 32, step_between_clips = 2, transform = train_transform, num_workers= 10)
 #train_hmdb51 = datasets.HMDB51("./data/", annotation_path = "hmdb51_annotation.csv", frames_per_clip= 32, step_between_clips = 2, transform = train_transform, num_workers= 10)
 #train_ds = torch.utils.data.ConcatDataset([train_kinetics, train_ucf, train_hmdb51])
@@ -216,9 +196,8 @@ def get_accuracy(pred, actual):
     return (correct_labels/len(pred))*100.0
 
 
-def train_with_extraction(model, victim, n_epochs=10000):
+def train_with_extraction(model, victim):
     # again, batch_size=1 due to compute restrictions on colab
-    sm = nn.Softmax(dim=-1)
     ct = 0
     ls1 = []
     ls2 = []
@@ -228,14 +207,14 @@ def train_with_extraction(model, victim, n_epochs=10000):
            ls2+=list(child.parameters())
         else:
            ls1+=list(child.parameters())
-    optim1 = torch.optim.Adam(ls1, lr=0.000015)
-    optim2 = torch.optim.Adam(ls2, lr=0.00015) #modified lr for training on 10 classes
+    optim1 = torch.optim.Adam(ls1, lr=0.00000015)
+    optim2 = torch.optim.Adam(ls2, lr=0.0000015) #modified lr for training on 10 classes
     criterion = nn.KLDivLoss()
 
     #optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     #criterion = nn.MSELoss()
 
-    for idx in range(n_epochs):
+    for idx in range(10):
       print('\nStarting Epoch: {}\n'.format(idx))
       rloss = 0.0;
       model.train()
@@ -248,25 +227,11 @@ def train_with_extraction(model, victim, n_epochs=10000):
           optim2.zero_grad()
           
           video = Variable(video.to(DEVICE), requires_grad=False)
-          #video = video.permute(0, 2, 1, 3, 4) # B, C, T, H, W
-          #print("current video size:", video.size())
-
-          vds = []
-          for vd in video:
-              vds.append(train_transform_Swin(vd))
-          swin_video = torch.stack(vds)
-          #swin_video = train_transform_Swin(video)
-          vds = []
-          for vd in video:
-              vds.append(train_transform_ResNet(vd))
-          resnet_video = torch.stack(vds)
-        
-          swin_video = swin_video.permute(0, 2, 1, 3, 4)
-          resnet_video = resnet_video.permute(0, 2, 1, 3, 4)
-          label_ = sm(victim(swin_video)) #take the softmax of logits for calculating the loss
+          video = video.permute(0, 2, 1, 3, 4)
+          label_ = victim(video)
          
-          #video = size_changer(video)
-          pred = model(resnet_video)
+          video = size_changer(video)
+          pred = model(video)
 
           # print(pred.size(), label_.size())
           
@@ -275,7 +240,7 @@ def train_with_extraction(model, victim, n_epochs=10000):
           loss.backward()
           optim1.step()
           optim2.step()
-          #print(f'Predicted class: {torch.argmax(pred, dim=1)}, Teacher class: {torch.argmax(label_, dim=-1)}, Actual label: {label}')
+          print(f'Predicted class: {torch.argmax(pred, dim=1)}, Teacher class: {torch.argmax(label_, dim=-1)}, Actual label: {label}')
           print(rloss/(step+1))
 
       print(f'avg loss: {rloss/len(train_dl)}')
@@ -285,28 +250,12 @@ def train_with_extraction(model, victim, n_epochs=10000):
           acc = []
           for step,(video, label) in enumerate(test_dl):
               video = Variable(video.to(DEVICE), requires_grad=False)
-              #video = video.permute(0, 2, 1, 3, 4) # B, C, T, H, W
-              #print("current video size:", video.size())
-      
-              vds = []
-              for vd in video:
-                  vds.append(train_transform_Swin(vd))
-              swin_video = torch.stack(vds)
-              #swin_video = train_transform_Swin(video)
-              vds = []
-              for vd in video:
-                  vds.append(train_transform_ResNet(vd))
-              resnet_video = torch.stack(vds)
-              
-              swin_video = swin_video.permute(0, 2, 1, 3, 4)
-              resnet_video = resnet_video.permute(0, 2, 1, 3, 4)
-
-              l_ = sm(victim(swin_video))
-              #video = size_changer(video)
-              prediction = model(resnet_video)
+              video = video.permute(0, 2, 1, 3, 4)
+              l_ = victim(video)
+              video = size_changer(video)
+              prediction = model(video)
           # l_ = victim(video)
               print(f'Predicted class: {torch.argmax(prediction, dim=1)}, Teacher class: {torch.argmax(l_, dim=1)}, Actual label: {label}')
-              #print(f'Predicted class: {prediction}, Teacher class: {l_}, Actual label: {label}')
           # print(torch.argmax(prediction, dim=1), label)
           # print(f'Accuracy : {(torch.sum(torch.argmax(prediction, dim=1) == label)/len(label))*100.0}%')
           # print(f'Accuracy : {get_accuracy(torch.argmax(prediction, dim=1).tolist(), label)}')
@@ -334,8 +283,9 @@ if __name__ == '__main__':
       param.requires_grad = False
     victim.eval()
 
-    net = C3D()
-    net.load_state_dict(torch.load('c3d.pickle'))
+    net = timesformer
+    print(net)
+    # net.load_state_dict(torch.load('c3d.pickle'))
     net.fc8 = nn.Linear(in_features=4096, out_features=400, bias=True)
     size_changer = torch.nn.AvgPool3d((1, 2, 2), stride=None, padding=0, ceil_mode=False)
     # adversary = torch.hub.load('facebookresearch/pytorchvideo', 'slow_r50', pretrained=False)
